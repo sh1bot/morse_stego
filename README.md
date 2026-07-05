@@ -44,7 +44,9 @@ steps), `--cap` (max LM tokens per word; 1 = clean whole words, raise if
 infeasible), `--seed` (vary the cover text
 reproducibly — same seed, same output; different seed, different cover),
 `--count` (print N covers from consecutive seeds, all from one model load, to
-pick one you like).
+pick one you like), `--beam` (width of an optional best-first frontier search;
+0 = depth-first, which measured identical on TinyStories since the per-word
+constraint nearly decomposes).
 
 To run against real weights with no network — e.g. after copying a model
 snapshot onto the machine — point `--model` at the directory:

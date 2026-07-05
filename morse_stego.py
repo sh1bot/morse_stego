@@ -295,12 +295,70 @@ def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
         stack.append(candidates_at(ns))
 
 
+def beam_search(prompt, accept, done, start_state, floor=-12.0, top_k=50,
+                beam_width=8, seed=None, max_rounds=256):
+    """Best-first beam frontier over the same accept/done constraint as backtrack.
+
+    Keep the `beam_width` highest cumulative-logprob partial covers, expand them
+    all one token, and re-prune to the best `beam_width`. A branch that dead-ends
+    (no legal continuation) simply produces no children and drops out -- the
+    "score a stuck branch poorly" behaviour, for free -- and the walk commits to
+    whole branches by global score rather than the first feasible one, so the
+    text is more fluent and less repetitive than the depth-first walk.
+
+    seed : perturb the per-token score with Gumbel noise (stochastic beam), so a
+           different (reproducible) cover surfaces per seed.
+
+    Returns (text, cover, total_logp, ok), or None if the beam empties without a
+    completion -- the caller should then fall back to the complete backtrack()."""
+    tok, _ = get_model()
+    banned = set(tok.all_special_ids or [])
+    rng = random.Random(seed) if seed is not None else None
+    start = tok(prompt, return_tensors=None)["input_ids"]
+
+    def gumbel():
+        if rng is None:
+            return 0.0
+        u = min(max(rng.random(), 1e-9), 1 - 1e-9)
+        return -math.log(-math.log(u))
+
+    # beam item: (ids, state, true_logp, score); score == true_logp unless seeded
+    beam = [(list(start), start_state, 0.0, 0.0)]
+    best = None                              # (score, true_logp, ids) of a completion
+    for _ in range(max_rounds):
+        if not beam:
+            break
+        children = []
+        for ids, state, tlp, score in beam:
+            lp = _next_logprobs(ids)
+            topv, topi = lp.topk(min(top_k, lp.shape[-1]))
+            for v, i in zip(topv.tolist(), topi.tolist()):
+                if v < floor or i in banned:
+                    continue
+                ns = accept(state, _text(i))
+                if ns is None:
+                    continue
+                child = (ids + [i], ns, tlp + v, score + v + gumbel())
+                if done(ns):
+                    if best is None or child[3] > best[0]:
+                        best = (child[3], child[2], child[0])
+                else:
+                    children.append(child)
+        children.sort(key=lambda c: c[3], reverse=True)
+        beam = children[:beam_width]
+
+    if best is None:
+        return None                          # beam died -> caller falls back to DFS
+    _, tlp, ids = best
+    return tok.decode(ids), tok.decode(ids[len(start):]), tlp, True
+
+
 # --------------------------------------------------------------------------- #
 # CLI.
 # --------------------------------------------------------------------------- #
 
 def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
-         budget=50_000, cap=1, seed=None):
+         budget=50_000, cap=1, seed=None, beam=0):
     """Encode `secret` to morse and generate cover text whose words spell it.
 
     The constraint runs per *word*: word i must have wordtomorse(word) == morse[i].
@@ -311,6 +369,10 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
     span tokens to hit a required final letter -- more feasible on a weak model,
     but it glues tokens ("for"+"no" -> "forno"), so prefer the lowest cap that
     still encodes your message.
+
+    `beam` > 0 runs a best-first beam frontier (more fluent, less repetitive) and
+    falls back to the complete depth-first backtrack if the beam finds no
+    completion; beam=0 uses the backtrack directly.
 
     Returns (normalized_secret, morse, text, cover, logprob, ok), where `text` is
     the full sentence and `cover` is the generated continuation to reverse."""
@@ -344,24 +406,19 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
             return None                       # wrong symbol, or no word slot left
         return (wi + 1, core, 1, False)
 
+    done = lambda s: s[3]
+    start_state = (0, "", 0, False)
+    if beam:                                 # best-first frontier, DFS as fallback
+        res = beam_search(prompt, accept, done, start_state, floor=floor,
+                          top_k=top_k, beam_width=beam, seed=seed,
+                          max_rounds=m * cap + 8)
+        if res is not None:
+            text, cover, logp, ok = res
+            return norm, morse, text, cover, logp, ok
     text, cover, logp, ok = backtrack(
-        prompt, accept, lambda s: s[3], start_state=(0, "", 0, False),
+        prompt, accept, done, start_state=start_state,
         floor=floor, top_k=top_k, budget=budget, max_tokens=m * cap + 8, seed=seed)
     return norm, morse, text, cover, logp, ok
-
-
-def highlight_symbol_char(word):
-    """Render a word with the character that decides its morse symbol -- the last
-    non-whitespace char, which is what wordtomorse keys on -- shown in bold yellow.
-
-    Handy for seeing why a word counts as dot/dash/gap: punctuation, 'y' and 'g'
-    all land in the gap class, so a word ending in ',' or 'y' fills a space."""
-    hl, rst = "\033[1;33m", "\033[0m"
-    core = word.rstrip()
-    if not core.strip():                         # whitespace/empty -> gap, no char
-        return f"[{word}]"
-    i = len(core) - 1                            # index of last non-whitespace char
-    return f"[{word[:i]}{hl}{word[i]}{rst}{word[i + 1:]}]"
 
 
 def main(argv=None):
@@ -374,6 +431,7 @@ def main(argv=None):
     p.add_argument("--top-k", type=int, default=200, help="candidate tokens considered per position")
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
     p.add_argument("--cap", type=int, default=1, help="max LM tokens per word (1 = clean whole words; raise if infeasible)")
+    p.add_argument("--beam", type=int, default=0, help="beam width for a frontier search (0 = depth-first; measured equal on TinyStories)")
     p.add_argument("--seed", type=int, default=None, help="seed to vary the cover text (reproducible)")
     p.add_argument("--count", type=int, default=1, help="produce N covers (different seeds) to choose from")
     args = p.parse_args(argv)
@@ -402,7 +460,7 @@ def main(argv=None):
             print(f"\n--- variant {n}/{count} (seed {sd}) ---")
         _, _, text, cover, logp, ok = hide(
             args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k,
-            budget=args.budget, cap=args.cap, seed=sd)
+            budget=args.budget, cap=args.cap, seed=sd, beam=args.beam)
         rc = max(rc, report(text, cover, logp, morse, norm, ok))
     return rc
 
@@ -421,8 +479,7 @@ def report(text, cover, logp, morse, norm, ok):
 
     recovered_morse = cover_to_morse(cover)     # OUTPUT words -> morse (drops ender)
     decoded = morse_to_text(recovered_morse)    # morse -> text
-    print("\nwords          : " + " ".join(highlight_symbol_char(w) for w in words))
-    print(f"reversed morse : {recovered_morse!r}")
+    print(f"\nreversed morse : {recovered_morse!r}")
     print(f"decoded text   : {decoded!r}")
 
     morse_ok = recovered_morse == morse
