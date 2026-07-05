@@ -39,8 +39,9 @@ Flags: `--prompt` (seed text), `--model` (HF hub id or a local model directory;
 or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
 steps), `--cap` (max LM tokens per word), `--seed` (vary the cover text
-reproducibly — same seed, same output; different seed, different cover). Re-run
-with a few seeds to pick a cover you like.
+reproducibly — same seed, same output; different seed, different cover),
+`--count` (print N covers from consecutive seeds, all from one model load, to
+pick one you like).
 
 To run against real weights with no network — e.g. after copying a model
 snapshot onto the machine — point `--model` at the directory:

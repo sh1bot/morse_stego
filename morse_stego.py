@@ -371,19 +371,41 @@ def main(argv=None):
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
     p.add_argument("--cap", type=int, default=2, help="max LM tokens per word (bounds the search)")
     p.add_argument("--seed", type=int, default=None, help="seed to vary the cover text (reproducible)")
+    p.add_argument("--count", type=int, default=1, help="produce N covers (different seeds) to choose from")
     args = p.parse_args(argv)
     MODEL_NAME = args.model
 
-    norm, morse, text, cover, logp, ok = hide(
-        args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k,
-        budget=args.budget, cap=args.cap, seed=args.seed)
-
+    norm = normalize(args.text)
+    morse = text_to_morse(norm)
     print(f"input       : {args.text!r}")
     print(f"normalized  : {norm!r}")
     print(f"morse       : {morse!r}")
     if not norm:
         print("\nNothing encodable in that input (need letters or digits).")
         return 1
+
+    # One seed per variant; consecutive from --seed (or 0) so a run is reproducible.
+    count = max(1, args.count)
+    if count == 1:
+        seeds = [args.seed]
+    else:
+        base = args.seed if args.seed is not None else 0
+        seeds = [base + i for i in range(count)]
+
+    rc = 0
+    for n, sd in enumerate(seeds, 1):
+        if count > 1:
+            print(f"\n--- variant {n}/{count} (seed {sd}) ---")
+        _, _, text, cover, logp, ok = hide(
+            args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k,
+            budget=args.budget, cap=args.cap, seed=sd)
+        rc = max(rc, report(text, cover, logp, morse, norm, ok))
+    return rc
+
+
+def report(text, cover, logp, morse, norm, ok):
+    """Print one cover and its round trip; return 0 (pass), 1 (infeasible),
+    or 2 (round-trip mismatch)."""
     if not ok:
         print("\nINFEASIBLE: could not spell that message with this model/prompt.")
         print("Try a shorter string, a lower --floor, or a higher --top-k.")
