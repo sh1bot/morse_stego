@@ -13,15 +13,15 @@ text  --encode-->  morse  --constrained generate-->  LM cover text
       <--decode--  morse  <--reverse-------------
 ```
 
-The generator is a backtracking constrained decoder: a best-first walk over the
-LM's tokens that builds one word at a time, backpedaling to re-pick earlier
-tokens whenever a position dead-ends. Each word is held whole as it is built (so
-the symbol rule can weigh more than the last letter later). By default a word is
-a single token — one clean whole word per symbol — which on a real model encodes
-a phrase like `"secret message"` in well under a second. `--cap N` lets a word
-span up to N tokens to hit a required final letter when a message is otherwise
-infeasible, but that glues tokens into non-words (`for`+`no` → `forno`), so use
-the lowest cap that still works.
+The generator is a word-level backtracking decoder. For each symbol it builds one
+ranked list of candidate words — whole single-token words *and* multi-token
+fusions together, scored by cumulative logprob — then walks them best-first,
+backing out a whole word when a position dead-ends. Ranking both kinds in one
+list is the point: a natural fusion (a word plus a comma, to spell a gap) can
+outrank a single word, while a clumsy one (`for`+`no` → `forno`) loses to any
+decent whole word. `--cap N` is the longest word (in tokens) the list may reach;
+`cap=2` (the default) reads better than `cap=1` because commas and other short
+tails make nicer sentences, and the ranking keeps the junk out on its own.
 
 The codec, model loader, decoder, and CLI live in `morse_stego.py`; the offline
 fallback model lives in `offline_model.py`.
@@ -40,15 +40,12 @@ input has nothing encodable, `2` on a round-trip mismatch.
 Flags: `--prompt` (seed text), `--model` (HF hub id or a local model directory;
 or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
-steps), `--cap` (max LM tokens per word; 1 = clean whole words, raise if
-infeasible), `--seed` (vary the cover text
+steps), `--cap` (longest word in LM tokens the candidate list may reach; default
+2), `--seed` (vary the cover text
 reproducibly — same seed, same output; different seed, different cover),
-`--temperature` (how bold that variety is; lower = milder and more coherent,
-and the beam wants a lower value than the DFS since its noise compounds),
+`--temperature` (how bold that variety is; lower = milder and more coherent),
 `--count` (print N covers from consecutive seeds, all from one model load, to
-pick one you like), `--beam` (width of an optional best-first frontier search;
-0 = depth-first, which measured identical on TinyStories since the per-word
-constraint nearly decomposes).
+pick one you like).
 
 To run against real weights with no network — e.g. after copying a model
 snapshot onto the machine — point `--model` at the directory:

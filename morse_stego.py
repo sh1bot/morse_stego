@@ -14,13 +14,15 @@ input. Because a symbol rides on a whole word -- which may be a couple of LM
 tokens -- the reversal reads the plain string and never has to reproduce the
 model's tokenization.
 
-The generator is a backtracking constrained decoder over a real LM: a best-first
-walk over the model's tokens that builds one word at a time, backpedaling to
-re-pick earlier tokens whenever a position dead-ends. A word is held whole as it
-is built (so wordtomorse can weigh more than the last letter in future). By
-default a word is a single token -- one clean whole word per symbol -- but --cap
-lets a word span tokens to hit a required final letter when a message is
-otherwise infeasible, at the cost of glued non-words ("for"+"no" -> "forno").
+The generator is a word-level backtracking decoder over a real LM. For each morse
+symbol it builds one ranked list of candidate words -- whole single-token words
+AND multi-token fusions together, scored by cumulative logprob -- then walks them
+best-first, backing out a whole word when a position dead-ends. Ranking the two
+kinds together is the point: a natural fusion (a word plus a comma, to spell a
+gap) can outrank a single word, while a clumsy one ("for"+"no" -> "forno") loses
+to any decent whole word. --cap is the longest word (in tokens) the list may
+reach; cap=2 is a good default because commas and other short tails make better
+sentences, and the ranking keeps the junk out on its own.
 
 Usage:
     python3 morse_stego.py "SOS"
@@ -35,6 +37,7 @@ them; the morse codec and --help stay import-light.
 """
 
 import argparse
+import heapq
 import math
 import os
 import random
@@ -227,137 +230,101 @@ def _next_logprobs(ids):
 # Backtracking constrained decoder.
 # --------------------------------------------------------------------------- #
 
-def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
-              budget=20_000, max_tokens=256, seed=None, temperature=1.0):
-    """Best-first DFS with backtracking on the real LM under a plausibility floor.
+def word_candidates(ids, matches, ender, cap, top_k, floor, banned, rng,
+                    temperature, max_passes):
+    """Ranked candidate *words* for the next position: each (added_ids, logp, word).
 
-    accept(state, token_text) -> next_state or None
-        Successor state if `token_text` may legally follow, else None (reject).
-        The caller threads whatever it needs through `state` -- here: which word
-        we are on and the whole word in progress.
-    done(state) -> bool
-        True when `state` is a complete, valid message; the search stops there.
-    floor : reject any candidate whose next-token logprob is below this; a
-            position with no surviving candidate is a dead-end to back out of.
-    top_k : how many of the vocab's best tokens to consider per position (the
-            real vocab is ~50k; we never need the long tail).
-    seed  : if given, perturb the candidate ordering with seeded Gumbel noise --
-            i.e. sample the walk from the model instead of taking the strict
-            best-first order, giving a different (reproducible) cover per seed.
-    temperature : scales the sampling when seeded (order by logprob/T + Gumbel).
-            T<1 stays near the best-first order (mild variety); T=1 samples from
-            the model; higher T is noisier. Ignored without a seed.
-
-    Returns (text, cover, total_logp, ok), where `text` is the full decoding
-    (prompt included) and `cover` is just the generated continuation -- the part
-    that carries the message. Finds the first legal sequence in the chosen order.
-    """
-    tok, _ = get_model()
-    banned = set(tok.all_special_ids or [])  # never weave EOS/pad/etc into a word
-    rng = random.Random(seed) if seed is not None else None
-    start = tok(prompt, return_tensors=None)["input_ids"]
-    ids = list(start)
-    cum = [0.0]
-    states = [start_state]
-
-    def _ret(ok):
-        return tok.decode(ids), tok.decode(ids[len(start):]), cum[-1], ok
-
-    def candidates_at(state):
-        if len(ids) - len(start) >= max_tokens:
-            return []                        # too long -> treat as a dead-end
-        lp = _next_logprobs(ids)
-        topv, topi = lp.topk(min(top_k, lp.shape[-1]))
-        cs = []
+    A candidate is a word-start token plus up to cap-1 continuation tokens whose
+    assembled form `matches` the position (its morse symbol, or a sentence-ender
+    when `ender`). Words of every length are gathered into ONE list and ranked by
+    cumulative logprob, so a natural fusion ("outside"+"," for a gap) can outrank
+    a single word, while a poor one ("for"+"no") cannot outrank a good single word.
+    We deepen (extend the best not-yet-matching openings) up to `max_passes`
+    forward passes, so a common position costs a single pass but fusions still get
+    a fair hearing."""
+    found = []
+    heap = [(0.0, 0, [], "")]                # (-logp, tiebreak, added_ids, word)
+    tie = passes = 0
+    while heap and passes < max_passes:
+        neg, _, added, word = heapq.heappop(heap)
+        logp, ntok = -neg, len(added)
+        topv, topi = _next_logprobs(ids + added).topk(top_k)
+        passes += 1
         for v, i in zip(topv.tolist(), topi.tolist()):
             if v < floor or i in banned:
-                continue                     # topk is best-first; rest only lower
-            ns = accept(state, _text(i))
-            if ns is not None:
-                cs.append((i, v, ns))
-        if rng is not None:                  # Gumbel-top-k: order = a sample at T
-            u = lambda: min(max(rng.random(), 1e-9), 1 - 1e-9)
-            cs.sort(key=lambda c: c[1] / temperature - math.log(-math.log(u())),
-                    reverse=True)
-        return cs
+                continue
+            cls = _classify(_text(i))
+            if cls is None:
+                continue
+            kind, core = cls
+            if ntok == 0:                    # the token that opens the word
+                if kind != ("ender" if ender else "start"):
+                    continue
+                nword = core
+            else:                            # a continuation of the opening
+                if kind != "cont":
+                    continue
+                nword = word + core
+            nlogp = logp + v
+            if matches(nword):
+                found.append((added + [i], nlogp, nword))
+            elif not ender and ntok + 1 < cap:
+                tie += 1
+                heapq.heappush(heap, (-nlogp, tie, added + [i], nword))
+    if rng is None:
+        found.sort(key=lambda c: c[1], reverse=True)
+    else:                                    # Gumbel-top-k over whole words, at T
+        found.sort(key=lambda c: c[1] / temperature - math.log(-math.log(
+            min(max(rng.random(), 1e-9), 1 - 1e-9))), reverse=True)
+    return found[:top_k]
 
-    stack = [candidates_at(states[-1])]      # untried candidates for each position
-    steps = 0
-    while True:
-        if (steps := steps + 1) > budget:
-            return _ret(False)
-        frame = stack[-1]
-        if not frame:                        # dead-end -> backpedal one level
-            if len(ids) == len(start):
-                return _ret(False)           # backed past prompt: infeasible
-            ids.pop(); cum.pop(); states.pop(); stack.pop()
-            continue
-        t, lp, ns = frame.pop(0)             # take & consume best remaining sibling
-        ids.append(t); cum.append(cum[-1] + lp); states.append(ns)
-        if done(ns):
-            return _ret(True)
-        stack.append(candidates_at(ns))
 
+def word_search(prompt, morse, cap=1, top_k=200, floor=-18.0, budget=50_000,
+                seed=None, temperature=1.0):
+    """Word-level best-first DFS. Fill positions 0..m-1 (one word per morse symbol)
+    then a trailing sentence-ender, each from word_candidates() ranked by
+    cumulative logprob, backtracking a whole word when a position runs dry.
 
-def beam_search(prompt, accept, done, start_state, floor=-12.0, top_k=50,
-                beam_width=8, seed=None, max_rounds=256, temperature=1.0):
-    """Best-first beam frontier over the same accept/done constraint as backtrack.
-
-    Keep the `beam_width` highest cumulative-logprob partial covers, expand them
-    all one token, and re-prune to the best `beam_width`. A branch that dead-ends
-    (no legal continuation) simply produces no children and drops out -- the
-    "score a stuck branch poorly" behaviour, for free -- and the walk commits to
-    whole branches by global score rather than the first feasible one.
-
-    seed        : perturb each token's score with Gumbel noise (stochastic beam),
-                  so a different (reproducible) cover surfaces per seed.
-    temperature : scales that noise (score by logprob/T + Gumbel). NOTE the noise
-                  is one draw per token and accumulates over the cover, so the
-                  beam wants a lower T than the DFS to stay coherent. Ignored
-                  without a seed.
-
-    Returns (text, cover, total_logp, ok), or None if the beam empties without a
-    completion -- the caller should then fall back to the complete backtrack()."""
+    Returns (text, cover, total_logp, ok); `cover` is the generated continuation."""
     tok, _ = get_model()
     banned = set(tok.all_special_ids or [])
     rng = random.Random(seed) if seed is not None else None
     start = tok(prompt, return_tensors=None)["input_ids"]
+    ids = list(start)
+    m = len(morse)
+    max_passes = 4 * cap                     # 1 opening pass + fusion deepening
 
-    def gumbel():
-        if rng is None:
-            return 0.0
-        u = min(max(rng.random(), 1e-9), 1 - 1e-9)
-        return -math.log(-math.log(u))
+    def frame_for(pos):
+        if pos < m:
+            sym = morse[pos]
+            return word_candidates(ids, lambda w: wordtomorse(w) == sym, False,
+                                   cap, top_k, floor, banned, rng, temperature,
+                                   max_passes)
+        return word_candidates(ids, lambda w: w.strip() in ENDERS, True,
+                               cap, top_k, floor, banned, rng, temperature,
+                               max_passes)
 
-    # beam item: (ids, state, true_logp, score); score == true_logp unless seeded
-    beam = [(list(start), start_state, 0.0, 0.0)]
-    best = None                              # (score, true_logp, ids) of a completion
-    for _ in range(max_rounds):
-        if not beam:
-            break
-        children = []
-        for ids, state, tlp, score in beam:
-            lp = _next_logprobs(ids)
-            topv, topi = lp.topk(min(top_k, lp.shape[-1]))
-            for v, i in zip(topv.tolist(), topi.tolist()):
-                if v < floor or i in banned:
-                    continue
-                ns = accept(state, _text(i))
-                if ns is None:
-                    continue
-                child = (ids + [i], ns, tlp + v, score + v / temperature + gumbel())
-                if done(ns):
-                    if best is None or child[3] > best[0]:
-                        best = (child[3], child[2], child[0])
-                else:
-                    children.append(child)
-        children.sort(key=lambda c: c[3], reverse=True)
-        beam = children[:beam_width]
-
-    if best is None:
-        return None                          # beam died -> caller falls back to DFS
-    _, tlp, ids = best
-    return tok.decode(ids), tok.decode(ids[len(start):]), tlp, True
+    added, logps, frames = [], [], [frame_for(0)]
+    steps = 0
+    while True:
+        frame = frames[-1]
+        if not frame:                        # dead-end -> back out one word
+            if not added:
+                return tok.decode(start), "", 0.0, False
+            for _ in added.pop():
+                ids.pop()
+            logps.pop()
+            frames.pop()
+            continue
+        if (steps := steps + 1) > budget:
+            return tok.decode(ids), tok.decode(ids[len(start):]), sum(logps), False
+        add_ids, lp, word = frame.pop(0)
+        ids += add_ids
+        added.append(add_ids)
+        logps.append(lp)
+        if len(added) > m:                   # just placed the ender -> done
+            return tok.decode(ids), tok.decode(ids[len(start):]), sum(logps), True
+        frames.append(frame_for(len(added)))
 
 
 # --------------------------------------------------------------------------- #
@@ -365,66 +332,24 @@ def beam_search(prompt, accept, done, start_state, floor=-12.0, top_k=50,
 # --------------------------------------------------------------------------- #
 
 def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
-         budget=50_000, cap=1, seed=None, beam=0, temperature=1.0):
+         budget=50_000, cap=2, seed=None, temperature=1.0):
     """Encode `secret` to morse and generate cover text whose words spell it.
 
-    The constraint runs per *word*: word i must have wordtomorse(word) == morse[i].
-    The search state carries the index of the word being built, the whole word so
-    far, and how many tokens it has taken; a word commits when the next word opens
-    (or the ender closes the last). `cap` bounds tokens per word. cap=1 (the
-    default) gives one clean whole-token word per symbol; raising it lets a word
-    span tokens to hit a required final letter -- more feasible on a weak model,
-    but it glues tokens ("for"+"no" -> "forno"), so prefer the lowest cap that
-    still encodes your message.
-
-    `beam` > 0 runs a best-first beam frontier (more fluent, less repetitive) and
-    falls back to the complete depth-first backtrack if the beam finds no
-    completion; beam=0 uses the backtrack directly.
+    One morse symbol per whitespace word (its last letter). word_search fills one
+    position per symbol, each from a single ranked list of candidate words that
+    mixes whole words and multi-token fusions by cumulative logprob -- so a natural
+    fusion (a word plus a comma, say) competes fairly and a poor one loses to any
+    good single word. `cap` is the longest word (in tokens) the list may reach.
 
     Returns (normalized_secret, morse, text, cover, logprob, ok), where `text` is
     the full sentence and `cover` is the generated continuation to reverse."""
     norm = normalize(secret)
     morse = text_to_morse(norm)              # 3-space word sep -> only . - and spaces
-    m = len(morse)
-    if m == 0:
+    if not morse:
         return norm, morse, prompt, "", 0.0, False
-
-    # state = (word_index, word_in_progress, tokens_in_word, finished)
-    def accept(state, token_text):
-        wi, cur, ntok, fin = state
-        if fin:
-            return None
-        cls = _classify(token_text)
-        if cls is None:
-            return None
-        kind, core = cls
-        if kind == "ender":                  # closes the last word, ends sentence
-            if cur and wi == m - 1 and wordtomorse(cur) == morse[wi]:
-                return (wi, cur, ntok, True)
-            return None
-        if kind == "cont":                   # extend the current word (up to cap)
-            if not cur or ntok >= cap:
-                return None
-            return (wi, cur + core, ntok + 1, False)
-        # kind == "start": open a word (committing the previous one first)
-        if not cur:                          # the very first word of the cover
-            return (wi, core, 1, False)
-        if wordtomorse(cur) != morse[wi] or wi + 1 > m - 1:
-            return None                       # wrong symbol, or no word slot left
-        return (wi + 1, core, 1, False)
-
-    done = lambda s: s[3]
-    start_state = (0, "", 0, False)
-    if beam:                                 # best-first frontier, DFS as fallback
-        res = beam_search(prompt, accept, done, start_state, floor=floor,
-                          top_k=top_k, beam_width=beam, seed=seed,
-                          max_rounds=m * cap + 8, temperature=temperature)
-        if res is not None:
-            text, cover, logp, ok = res
-            return norm, morse, text, cover, logp, ok
-    text, cover, logp, ok = backtrack(
-        prompt, accept, done, start_state=start_state, floor=floor, top_k=top_k,
-        budget=budget, max_tokens=m * cap + 8, seed=seed, temperature=temperature)
+    text, cover, logp, ok = word_search(
+        prompt, morse, cap=cap, top_k=top_k, floor=floor, budget=budget,
+        seed=seed, temperature=temperature)
     return norm, morse, text, cover, logp, ok
 
 
@@ -437,8 +362,7 @@ def main(argv=None):
     p.add_argument("--floor", type=float, default=-18.0, help="min per-token logprob (lower = more permissive)")
     p.add_argument("--top-k", type=int, default=200, help="candidate tokens considered per position")
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
-    p.add_argument("--cap", type=int, default=1, help="max LM tokens per word (1 = clean whole words; raise if infeasible)")
-    p.add_argument("--beam", type=int, default=0, help="beam width for a frontier search (0 = depth-first; measured equal on TinyStories)")
+    p.add_argument("--cap", type=int, default=2, help="longest word in LM tokens the candidate list may reach")
     p.add_argument("--seed", type=int, default=None, help="seed to vary the cover text (reproducible)")
     p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature for --seed (lower = milder variety)")
     p.add_argument("--count", type=int, default=1, help="produce N covers (different seeds) to choose from")
@@ -468,7 +392,7 @@ def main(argv=None):
             print(f"\n--- variant {n}/{count} (seed {sd}) ---")
         _, _, text, cover, logp, ok = hide(
             args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k,
-            budget=args.budget, cap=args.cap, seed=sd, beam=args.beam,
+            budget=args.budget, cap=args.cap, seed=sd,
             temperature=args.temperature)
         rc = max(rc, report(text, cover, logp, morse, norm, ok))
     return rc
