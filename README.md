@@ -38,7 +38,9 @@ Exit code `0` on a verified round trip, `1` if generation is infeasible or the
 input has nothing encodable, `2` on a round-trip mismatch.
 
 Flags: `--prompt` (seed text), `--model` (HF hub id or a local model directory;
-or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
+or set `MORSE_MODEL`), `--device` (`cuda`/`mps`/`cpu`, default auto), `--dtype`
+(default auto: bf16/fp16 on GPU, fp32 on CPU), `--trust-remote-code` (for models
+that ship custom code), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
 steps), `--cap` (longest word in LM tokens the candidate list may reach; default
 2), `--seed` (vary the cover text
@@ -47,12 +49,24 @@ reproducibly — same seed, same output; different seed, different cover),
 `--count` (print N covers from consecutive seeds, all from one model load, to
 pick one you like).
 
-To run against real weights with no network — e.g. after copying a model
-snapshot onto the machine — point `--model` at the directory:
+## Choosing a model
+
+`--model` takes any Hugging Face causal-LM id or a local directory — switching
+models is just the normal HF interface, with the weights cached under `HF_HOME`.
+A better *base* model makes the cover text far more lucid; pick a **byte-level
+BPE** family (GPT-2/Neo, **Qwen2.5**, **Llama-3**) so word starts carry a leading
+space — the tool warns if a tokenizer (some SentencePiece ones) doesn't. Prefer a
+base model over an instruct/chat one, since the cover text is a free continuation.
 
 ```
-python3 morse_stego.py "secret message" --model /path/to/distilgpt2
+python3 morse_stego.py "secret message" --model Qwen/Qwen2.5-1.5B      # lucid, CPU-friendly
+python3 morse_stego.py "secret message" --model Qwen/Qwen2.5-7B --device cuda
+python3 morse_stego.py "secret message" --model /path/to/local/model  # offline, real weights
 ```
+
+Bigger models are more fluent but the search makes many forward passes
+(~`4·cap` per word), so use a GPU past ~3B, and note that a lucid model often
+reads well at `--cap 1` (one pass per word, much faster).
 
 `fetch_tinystories.py` collates a small real model (`roneneldan/TinyStories-3M`,
 ~12 MB) plus its tokenizer into one self-contained folder, so anyone can

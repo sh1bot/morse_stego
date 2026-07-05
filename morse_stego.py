@@ -170,44 +170,94 @@ def _classify(text):
 # Language model -- loaded lazily so the codec above and --help stay torch-free.
 # --------------------------------------------------------------------------- #
 
-# A HF hub id or a local directory of an uploaded model. Point MORSE_MODEL (or
-# --model) at a local model snapshot to run against real weights with no network.
+# Any Hugging Face causal-LM id or a local model directory works via --model /
+# MORSE_MODEL -- switch models entirely through the normal HF interface. A better
+# base model (byte-level BPE like Qwen2.5 or Llama-3, so word starts carry a
+# leading space) makes the cover text far more lucid; --device / --dtype control
+# where and how it runs.
 MODEL_NAME = os.environ.get("MORSE_MODEL", "distilgpt2")
+MODEL_DEVICE = os.environ.get("MORSE_DEVICE")            # None -> auto-detect
+MODEL_DTYPE = os.environ.get("MORSE_DTYPE")              # None -> auto by device
+TRUST_REMOTE_CODE = os.environ.get("MORSE_TRUST_REMOTE_CODE", "") not in ("", "0")
 _MODEL = None
 
 
+def _resolve_device():
+    if MODEL_DEVICE:
+        return MODEL_DEVICE
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def get_model():
-    """Return (tokenizer, model), loading once. A pretrained model when Hugging
-    Face is reachable (or a local --model directory), else the trained tiny GPT-2
-    from offline_model -- only the text quality differs, the constraints are
-    enforced identically either way.
+    """Return (tokenizer, model), loading once. Any HF causal LM named by --model /
+    MORSE_MODEL (or a local directory), else the trained tiny GPT-2 from
+    offline_model -- only the text quality differs, the constraints are enforced
+    identically either way.
 
     The local Hugging Face cache is tried first with no network call, so once a
-    model has been fetched later runs load it silently (no repeated download or
-    rate-limit chatter). Set HF_HOME to a persistent directory to keep that cache
-    across ephemeral environments; or point --model at a local snapshot."""
+    model has been fetched later runs load it silently. Set HF_HOME to a
+    persistent cache. The model is placed on --device (auto: cuda/mps/cpu) at a
+    dtype that suits it (bf16/fp16 on GPU, fp32 on CPU to avoid half-precision CPU
+    ops); override with --dtype."""
     global _MODEL
     if _MODEL is not None:
         return _MODEL
 
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = _resolve_device()
+    common = {"trust_remote_code": True} if TRUST_REMOTE_CODE else {}
+    load = dict(common)
+    if MODEL_DTYPE:
+        load["torch_dtype"] = getattr(torch, MODEL_DTYPE)
+    elif device != "cpu":                        # half precision only off the CPU
+        load["torch_dtype"] = (torch.bfloat16 if device == "cuda"
+                               and torch.cuda.is_bf16_supported() else torch.float16)
+
+    def _load(local_only):
+        kw = {"local_files_only": True} if local_only else {}
+        tok = AutoTokenizer.from_pretrained(MODEL_NAME, **kw, **common)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **kw, **load)
+        return tok, model
+
+    real = True
     try:                                         # 1) local cache/dir -- no network
-        tok = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
-        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, local_files_only=True)
-        print(f"[loaded {MODEL_NAME} from local files]\n")
+        tok, model = _load(True); via = "local files"
     except Exception:
         try:                                     # 2) download, populating the cache
-            tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-            model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-            print(f"[downloaded {MODEL_NAME} to cache]\n")
+            tok, model = _load(False); via = "download"
         except Exception as e:                   # 3) offline trained tiny GPT-2
             from offline_model import load_offline_model
             print(f"[no HF access ({type(e).__name__}); using offline tiny GPT-2 — "
                   f"text is gibberish but constraints are real]\n")
-            tok, model = load_offline_model()
+            tok, model = load_offline_model(); real = False
+    if real:
+        model.to(device)
+        print(f"[loaded {MODEL_NAME} from {via} on {model.device}]\n")
+        _warn_if_word_boundaries_unclear(tok)
     model.eval()
     _MODEL = (tok, model)
     return _MODEL
+
+
+def _warn_if_word_boundaries_unclear(tok):
+    """The word split keys on a leading space marking each word start; byte-level
+    BPE tokenizers (GPT-2, Qwen2.5, Llama-3) satisfy this, some SentencePiece ones
+    do not. Warn rather than fail, since only text quality is at stake."""
+    try:
+        pieces = [tok.decode([i]) for i in tok(" one two three")["input_ids"]]
+    except Exception:
+        return
+    if not any(p.startswith(" ") for p in pieces):
+        print("[warning: this tokenizer doesn't mark word starts with a leading "
+              "space, so the word split may misbehave -- prefer a byte-level BPE "
+              "model such as Qwen2.5 or Llama-3]\n")
 
 
 @lru_cache(maxsize=None)
@@ -222,8 +272,9 @@ def _next_logprobs(ids):
     import torch.nn.functional as F
     _, model = get_model()
     with torch.no_grad():
-        logits = model(torch.tensor([ids])).logits[0, -1]
-    return F.log_softmax(logits, dim=-1)
+        inp = torch.tensor([ids], device=model.device)
+        logits = model(inp).logits[0, -1]
+    return F.log_softmax(logits.float(), dim=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -354,11 +405,14 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
 
 
 def main(argv=None):
-    global MODEL_NAME
+    global MODEL_NAME, MODEL_DEVICE, MODEL_DTYPE, TRUST_REMOTE_CODE
     p = argparse.ArgumentParser(description="Hide a string in LM text via morse, then verify it decodes back.")
     p.add_argument("text", help="the string to hide (letters/digits; case & punctuation are normalized away)")
     p.add_argument("--prompt", default="The weather today is", help="seed prompt for the cover text")
     p.add_argument("--model", default=MODEL_NAME, help="HF hub id or local model directory (or set MORSE_MODEL)")
+    p.add_argument("--device", default=MODEL_DEVICE, help="cuda / mps / cpu (default: auto-detect)")
+    p.add_argument("--dtype", default=MODEL_DTYPE, help="torch dtype, e.g. bfloat16 / float16 / float32 (default: auto)")
+    p.add_argument("--trust-remote-code", action="store_true", default=TRUST_REMOTE_CODE, help="allow models that ship custom code")
     p.add_argument("--floor", type=float, default=-18.0, help="min per-token logprob (lower = more permissive)")
     p.add_argument("--top-k", type=int, default=200, help="candidate tokens considered per position")
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
@@ -368,6 +422,9 @@ def main(argv=None):
     p.add_argument("--count", type=int, default=1, help="produce N covers (different seeds) to choose from")
     args = p.parse_args(argv)
     MODEL_NAME = args.model
+    MODEL_DEVICE = args.device
+    MODEL_DTYPE = args.dtype
+    TRUST_REMOTE_CODE = args.trust_remote_code
 
     norm = normalize(args.text)
     morse = text_to_morse(norm)
