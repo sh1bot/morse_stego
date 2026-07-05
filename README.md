@@ -33,9 +33,17 @@ python3 morse_stego.py "secret" --floor -18 --top-k 300
 Exit code `0` on a verified round trip, `1` if generation is infeasible or the
 input has nothing encodable, `2` on a round-trip mismatch.
 
-Flags: `--prompt` (seed text), `--floor` (min per-token logprob; lower = more
+Flags: `--prompt` (seed text), `--model` (HF hub id or a local model directory;
+or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
 steps).
+
+To run against real weights with no network — e.g. after copying a `distilgpt2`
+snapshot onto the machine — point `--model` at the directory:
+
+```
+python3 morse_stego.py "secret message" --model /path/to/distilgpt2
+```
 
 ## Requirements
 

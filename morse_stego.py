@@ -32,6 +32,7 @@ them; the morse codec and --help stay import-light.
 """
 
 import argparse
+import os
 import re
 import sys
 from functools import lru_cache
@@ -153,7 +154,10 @@ def _classify(text):
 # Language model -- loaded lazily so the codec above and --help stay torch-free.
 # --------------------------------------------------------------------------- #
 
-MODEL_NAME = "distilgpt2"
+# A HF hub id or a local directory of an uploaded model. Point MORSE_MODEL (or
+# --model) at a local distilgpt2 snapshot to run fully offline against real
+# weights -- exactly what you want after uploading a model into a sandbox.
+MODEL_NAME = os.environ.get("MORSE_MODEL", "distilgpt2")
 _MODEL = None
 
 
@@ -322,13 +326,16 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
 
 
 def main(argv=None):
+    global MODEL_NAME
     p = argparse.ArgumentParser(description="Hide a string in LM text via morse, then verify it decodes back.")
     p.add_argument("text", help="the string to hide (letters/digits; case & punctuation are normalized away)")
     p.add_argument("--prompt", default="The weather today is", help="seed prompt for the cover text")
+    p.add_argument("--model", default=MODEL_NAME, help="HF hub id or local model directory (or set MORSE_MODEL)")
     p.add_argument("--floor", type=float, default=-18.0, help="min per-token logprob (lower = more permissive)")
     p.add_argument("--top-k", type=int, default=200, help="candidate tokens considered per position")
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
     args = p.parse_args(argv)
+    MODEL_NAME = args.model
 
     norm, morse, text, cover, logp, ok = hide(
         args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k, budget=args.budget)
