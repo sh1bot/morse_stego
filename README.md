@@ -1,12 +1,10 @@
 # morse_stego
 
 Hide a short string inside plausible language-model text, then prove it back
-out. The cover text is generated so that each whitespace *word's* last letter
-spells one Morse symbol of your message — vowel-final = dot, consonant-final =
-dash, `y`-final/punctuation = gap — followed by a sentence-ender. Reversing the
-words recovers the Morse, which decodes back to your string. Because a symbol
-rides on a whole word — which may be several LM tokens — the reversal reads the
-plain string and never has to reproduce the model's tokenization.
+out. The cover text is generated so that each *token's* last letter spells one
+Morse symbol of your message — vowel-final = dot, consonant-final = dash,
+`y`-final/space = gap — followed by a sentence-ender. Reversing the generated
+tokens recovers the Morse, which decodes back to your string.
 
 ```
 text  --encode-->  morse  --constrained generate-->  LM cover text
@@ -14,13 +12,14 @@ text  --encode-->  morse  --constrained generate-->  LM cover text
 ```
 
 The generator is a backtracking constrained decoder: a best-first walk over the
-LM's tokens that builds one word at a time under the per-word constraint,
-backpedaling to re-pick earlier tokens whenever a position dead-ends, so the
-whole message (trailing ender included) is satisfied rather than greedily
-stranded.
+LM's tokens under the per-symbol constraint, backpedaling to re-pick earlier
+tokens whenever a position dead-ends, so the whole message (trailing ender
+included) is satisfied rather than greedily stranded. One symbol per token keeps
+the search dense — a real model encodes a phrase like `"secret message"` in a few
+dozen tokens.
 
-Everything lives in one file, `morse_stego.py`: the Morse codec, the model
-loader, the decoder, and the CLI.
+The codec, model loader, decoder, and CLI live in `morse_stego.py`; the offline
+fallback model lives in `offline_model.py`.
 
 ## Run
 
@@ -54,12 +53,10 @@ The local HF cache is tried first with no network call, so once distilgpt2 has
 been fetched later runs load it silently — set `HF_HOME` to a persistent
 directory to keep that cache across throwaway environments.
 
-Offline, it falls back to a small GPT-2 trained on the fly (see
-`offline_model.py`), on a "word-ending pangram" corpus — short words grouped so
-every final-letter class (vowel, consonant, `y`) is covered. The text is
-gibberish but the constraint and the round trip are exactly the same. Training
-takes a few seconds and is cached under `~/.cache/morse_stego`, so only the first
-offline run pays for it. The offline model is weak, so longer strings need a
-narrower, deeper search: e.g. `"SOS" --top-k 50 --budget 400000`. In general,
-raise `--top-k`/lower `--floor` for the real model and lower `--top-k`/raise
-`--budget` for the offline one.
+Offline (no network and nothing cached), it falls back to a small GPT-2 trained
+on the fly (see `offline_model.py`) on a "token-ending pangram" corpus — short
+words grouped so every final-letter class (vowel, consonant, `y`) is covered.
+The text is gibberish but the constraint and the round trip are exactly the same.
+Training takes a few seconds and is cached under `~/.cache/morse_stego`, so only
+the first offline run pays for it. The offline model is weak, so long strings may
+still report `INFEASIBLE`; a real model (via `--model`) is what handles phrases.
