@@ -43,6 +43,8 @@ permissive), `--top-k` (candidates per position), `--budget` (max backtracking
 steps), `--cap` (max LM tokens per word; 1 = clean whole words, raise if
 infeasible), `--seed` (vary the cover text
 reproducibly — same seed, same output; different seed, different cover),
+`--temperature` (how bold that variety is; lower = milder and more coherent,
+and the beam wants a lower value than the DFS since its noise compounds),
 `--count` (print N covers from consecutive seeds, all from one model load, to
 pick one you like), `--beam` (width of an optional best-first frontier search;
 0 = depth-first, which measured identical on TinyStories since the per-word

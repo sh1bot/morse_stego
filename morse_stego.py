@@ -228,7 +228,7 @@ def _next_logprobs(ids):
 # --------------------------------------------------------------------------- #
 
 def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
-              budget=20_000, max_tokens=256, seed=None):
+              budget=20_000, max_tokens=256, seed=None, temperature=1.0):
     """Best-first DFS with backtracking on the real LM under a plausibility floor.
 
     accept(state, token_text) -> next_state or None
@@ -244,6 +244,9 @@ def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
     seed  : if given, perturb the candidate ordering with seeded Gumbel noise --
             i.e. sample the walk from the model instead of taking the strict
             best-first order, giving a different (reproducible) cover per seed.
+    temperature : scales the sampling when seeded (order by logprob/T + Gumbel).
+            T<1 stays near the best-first order (mild variety); T=1 samples from
+            the model; higher T is noisier. Ignored without a seed.
 
     Returns (text, cover, total_logp, ok), where `text` is the full decoding
     (prompt included) and `cover` is just the generated continuation -- the part
@@ -272,9 +275,10 @@ def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
             ns = accept(state, _text(i))
             if ns is not None:
                 cs.append((i, v, ns))
-        if rng is not None:                  # Gumbel-top-k: order = a sample
+        if rng is not None:                  # Gumbel-top-k: order = a sample at T
             u = lambda: min(max(rng.random(), 1e-9), 1 - 1e-9)
-            cs.sort(key=lambda c: c[1] - math.log(-math.log(u())), reverse=True)
+            cs.sort(key=lambda c: c[1] / temperature - math.log(-math.log(u())),
+                    reverse=True)
         return cs
 
     stack = [candidates_at(states[-1])]      # untried candidates for each position
@@ -296,18 +300,21 @@ def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
 
 
 def beam_search(prompt, accept, done, start_state, floor=-12.0, top_k=50,
-                beam_width=8, seed=None, max_rounds=256):
+                beam_width=8, seed=None, max_rounds=256, temperature=1.0):
     """Best-first beam frontier over the same accept/done constraint as backtrack.
 
     Keep the `beam_width` highest cumulative-logprob partial covers, expand them
     all one token, and re-prune to the best `beam_width`. A branch that dead-ends
     (no legal continuation) simply produces no children and drops out -- the
     "score a stuck branch poorly" behaviour, for free -- and the walk commits to
-    whole branches by global score rather than the first feasible one, so the
-    text is more fluent and less repetitive than the depth-first walk.
+    whole branches by global score rather than the first feasible one.
 
-    seed : perturb the per-token score with Gumbel noise (stochastic beam), so a
-           different (reproducible) cover surfaces per seed.
+    seed        : perturb each token's score with Gumbel noise (stochastic beam),
+                  so a different (reproducible) cover surfaces per seed.
+    temperature : scales that noise (score by logprob/T + Gumbel). NOTE the noise
+                  is one draw per token and accumulates over the cover, so the
+                  beam wants a lower T than the DFS to stay coherent. Ignored
+                  without a seed.
 
     Returns (text, cover, total_logp, ok), or None if the beam empties without a
     completion -- the caller should then fall back to the complete backtrack()."""
@@ -338,7 +345,7 @@ def beam_search(prompt, accept, done, start_state, floor=-12.0, top_k=50,
                 ns = accept(state, _text(i))
                 if ns is None:
                     continue
-                child = (ids + [i], ns, tlp + v, score + v + gumbel())
+                child = (ids + [i], ns, tlp + v, score + v / temperature + gumbel())
                 if done(ns):
                     if best is None or child[3] > best[0]:
                         best = (child[3], child[2], child[0])
@@ -358,7 +365,7 @@ def beam_search(prompt, accept, done, start_state, floor=-12.0, top_k=50,
 # --------------------------------------------------------------------------- #
 
 def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
-         budget=50_000, cap=1, seed=None, beam=0):
+         budget=50_000, cap=1, seed=None, beam=0, temperature=1.0):
     """Encode `secret` to morse and generate cover text whose words spell it.
 
     The constraint runs per *word*: word i must have wordtomorse(word) == morse[i].
@@ -411,13 +418,13 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
     if beam:                                 # best-first frontier, DFS as fallback
         res = beam_search(prompt, accept, done, start_state, floor=floor,
                           top_k=top_k, beam_width=beam, seed=seed,
-                          max_rounds=m * cap + 8)
+                          max_rounds=m * cap + 8, temperature=temperature)
         if res is not None:
             text, cover, logp, ok = res
             return norm, morse, text, cover, logp, ok
     text, cover, logp, ok = backtrack(
-        prompt, accept, done, start_state=start_state,
-        floor=floor, top_k=top_k, budget=budget, max_tokens=m * cap + 8, seed=seed)
+        prompt, accept, done, start_state=start_state, floor=floor, top_k=top_k,
+        budget=budget, max_tokens=m * cap + 8, seed=seed, temperature=temperature)
     return norm, morse, text, cover, logp, ok
 
 
@@ -433,6 +440,7 @@ def main(argv=None):
     p.add_argument("--cap", type=int, default=1, help="max LM tokens per word (1 = clean whole words; raise if infeasible)")
     p.add_argument("--beam", type=int, default=0, help="beam width for a frontier search (0 = depth-first; measured equal on TinyStories)")
     p.add_argument("--seed", type=int, default=None, help="seed to vary the cover text (reproducible)")
+    p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature for --seed (lower = milder variety)")
     p.add_argument("--count", type=int, default=1, help="produce N covers (different seeds) to choose from")
     args = p.parse_args(argv)
     MODEL_NAME = args.model
@@ -460,7 +468,8 @@ def main(argv=None):
             print(f"\n--- variant {n}/{count} (seed {sd}) ---")
         _, _, text, cover, logp, ok = hide(
             args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k,
-            budget=args.budget, cap=args.cap, seed=sd, beam=args.beam)
+            budget=args.budget, cap=args.cap, seed=sd, beam=args.beam,
+            temperature=args.temperature)
         rc = max(rc, report(text, cover, logp, morse, norm, ok))
     return rc
 
