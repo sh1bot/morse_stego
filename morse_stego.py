@@ -259,6 +259,21 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
     return norm, morse, text, pieces, logp, ok
 
 
+def highlight_symbol_char(piece):
+    """Render a generated token with the character that decides its morse symbol
+    -- the last non-whitespace char, which is what wordtomorse keys on -- shown
+    in bold yellow. A whitespace/empty token has no such char and spells a gap.
+
+    Handy for seeing why a token counts as dot/dash/gap: punctuation, 'y' and 'g'
+    all land in the gap class, so a token ending in ',' or '.' fills a space."""
+    hl, rst = "\033[1;33m", "\033[0m"
+    core = piece.rstrip()
+    if not core.strip():                         # whitespace/empty -> gap, no char
+        return f"[{piece}]"
+    i = len(core) - 1                            # index of last non-whitespace char
+    return f"[{piece[:i]}{hl}{piece[i]}{rst}{piece[i + 1:]}]"
+
+
 def main(argv=None):
     global MODEL_NAME
     p = argparse.ArgumentParser(description="Hide a string in LM text via morse, then verify it decodes back.")
@@ -290,7 +305,8 @@ def main(argv=None):
 
     recovered_morse = tokens_to_morse(pieces)   # OUTPUT -> morse (drops the ender)
     decoded = morse_to_text(recovered_morse)    # morse -> text
-    print(f"\nreversed morse : {recovered_morse!r}")
+    print("\ntokens         : " + " ".join(highlight_symbol_char(p) for p in pieces))
+    print(f"reversed morse : {recovered_morse!r}")
     print(f"decoded text   : {decoded!r}")
 
     morse_ok = recovered_morse == morse
