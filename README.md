@@ -1,10 +1,12 @@
 # morse_stego
 
 Hide a short string inside plausible language-model text, then prove it back
-out. The cover text is generated so that each token's *last letter* spells one
-Morse symbol of your message — vowel-final = dot, consonant-final = dash,
-`y`-final/space = gap — followed by a sentence-ender. Reversing the tokens
-recovers the Morse, which decodes back to your string.
+out. The cover text is generated so that each whitespace *word's* last letter
+spells one Morse symbol of your message — vowel-final = dot, consonant-final =
+dash, `y`-final/punctuation = gap — followed by a sentence-ender. Reversing the
+words recovers the Morse, which decodes back to your string. Because a symbol
+rides on a whole word — which may be several LM tokens — the reversal reads the
+plain string and never has to reproduce the model's tokenization.
 
 ```
 text  --encode-->  morse  --constrained generate-->  LM cover text
@@ -12,9 +14,10 @@ text  --encode-->  morse  --constrained generate-->  LM cover text
 ```
 
 The generator is a backtracking constrained decoder: a best-first walk over the
-LM's tokens under the per-symbol constraint, backpedaling to re-pick earlier
-tokens whenever a position dead-ends, so the whole message (trailing ender
-included) is satisfied rather than greedily stranded.
+LM's tokens that builds one word at a time under the per-word constraint,
+backpedaling to re-pick earlier tokens whenever a position dead-ends, so the
+whole message (trailing ender included) is satisfied rather than greedily
+stranded.
 
 Everything lives in one file, `morse_stego.py`: the Morse codec, the model
 loader, the decoder, and the CLI.
@@ -41,5 +44,5 @@ them, so `--help` and the Morse codec stay import-light. With Hugging Face
 access the tool loads distilgpt2 and the cover text reads like (rough) English;
 offline it falls back to a tiny random GPT-2 — the text is gibberish but the
 constraint and the round trip are exactly the same. Longer strings need more
-constrained tokens, so very long inputs may report `INFEASIBLE`; raise
+constrained words, so very long inputs may report `INFEASIBLE`; raise
 `--top-k` or lower `--floor`.
