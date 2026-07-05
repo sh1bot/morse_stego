@@ -41,8 +41,17 @@ steps).
 
 `torch`, `transformers`, `tokenizers` — but only the generation step imports
 them, so `--help` and the Morse codec stay import-light. With Hugging Face
-access the tool loads distilgpt2 and the cover text reads like (rough) English;
-offline it falls back to a tiny random GPT-2 — the text is gibberish but the
-constraint and the round trip are exactly the same. Longer strings need more
-constrained words, so very long inputs may report `INFEASIBLE`; raise
-`--top-k` or lower `--floor`.
+access the tool loads distilgpt2 and the cover text reads like (rough) English.
+The local HF cache is tried first with no network call, so once distilgpt2 has
+been fetched later runs load it silently — set `HF_HOME` to a persistent
+directory to keep that cache across throwaway environments.
+
+Offline, it falls back to a small GPT-2 trained on the fly (see
+`offline_model.py`), on a "word-ending pangram" corpus — short words grouped so
+every final-letter class (vowel, consonant, `y`) is covered. The text is
+gibberish but the constraint and the round trip are exactly the same. Training
+takes a few seconds and is cached under `~/.cache/morse_stego`, so only the first
+offline run pays for it. The offline model is weak, so longer strings need a
+narrower, deeper search: e.g. `"SOS" --top-k 50 --budget 400000`. In general,
+raise `--top-k`/lower `--floor` for the real model and lower `--top-k`/raise
+`--budget` for the offline one.

@@ -159,79 +159,35 @@ _MODEL = None
 
 def get_model():
     """Return (tokenizer, model), loading once. Pretrained distilgpt2 when
-    Hugging Face is reachable, else a tiny random GPT-2 built offline -- only the
-    text quality differs, the constraints are enforced identically either way."""
+    Hugging Face is reachable, else the trained tiny GPT-2 from offline_model --
+    only the text quality differs, the constraints are enforced identically.
+
+    The local Hugging Face cache is tried first with no network call, so once
+    distilgpt2 has been fetched, later runs load it silently (no repeated
+    download or rate-limit chatter). Set HF_HOME to a persistent directory to
+    keep that cache across ephemeral environments."""
     global _MODEL
     if _MODEL is not None:
         return _MODEL
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    try:
-        tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-        print(f"[loaded pretrained {MODEL_NAME}]\n")
-    except Exception as e:
-        from transformers import GPT2Config, GPT2LMHeadModel
-        print(f"[no HF access ({type(e).__name__}); using tiny random GPT-2 — "
-              f"text is gibberish but constraints are real]\n")
-        tok = _tiny_tokenizer()
-        cfg = GPT2Config(vocab_size=tok.vocab_size, n_positions=1024,
-                         n_embd=64, n_layer=2, n_head=2)
-        model = GPT2LMHeadModel(cfg)
+    try:                                         # 1) local cache only -- no network
+        tok = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, local_files_only=True)
+        print(f"[loaded {MODEL_NAME} from local cache]\n")
+    except Exception:
+        try:                                     # 2) download, populating the cache
+            tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+            model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+            print(f"[downloaded {MODEL_NAME} to cache]\n")
+        except Exception as e:                   # 3) offline trained tiny GPT-2
+            from offline_model import load_offline_model
+            print(f"[no HF access ({type(e).__name__}); using offline tiny GPT-2 — "
+                  f"text is gibberish but constraints are real]\n")
+            tok, model = load_offline_model()
     model.eval()
-
-    # The tiny tokenizer's special-token ids sit inside its small vocab; align
-    # the model config so validation and stopping behave.
-    if getattr(model.config, "vocab_size", None) and model.config.eos_token_id and \
-            model.config.eos_token_id >= model.config.vocab_size:
-        model.config.eos_token_id = model.config.bos_token_id = tok.eos_token_id
-        model.generation_config.eos_token_id = tok.eos_token_id
-        model.generation_config.pad_token_id = tok.eos_token_id
-
     _MODEL = (tok, model)
     return _MODEL
-
-
-# Public-domain corpus (Lincoln's Gettysburg Address, 1863) for the offline
-# tokenizer -- enough varied word endings (vowels, consonants, y, and the '.'
-# sentence-ender) that the constrained search can actually satisfy real messages
-# without a downloaded model. Only used when Hugging Face is unreachable.
-_CORPUS = (
-    "Four score and seven years ago our fathers brought forth on this continent "
-    "a new nation conceived in liberty and dedicated to the proposition that all "
-    "men are created equal . Now we are engaged in a great civil war testing "
-    "whether that nation or any nation so conceived and so dedicated can long "
-    "endure . We are met on a great battlefield of that war . We have come to "
-    "dedicate a portion of that field as a final resting place for those who here "
-    "gave their lives that that nation might live . It is altogether fitting and "
-    "proper that we should do this . But in a larger sense we can not dedicate we "
-    "can not consecrate we can not hallow this ground . The brave men living and "
-    "dead who struggled here have consecrated it far above our poor power to add "
-    "or detract . The world will little note nor long remember what we say here "
-    "but it can never forget what they did here . It is for us the living rather "
-    "to be dedicated here to the unfinished work which they who fought here have "
-    "thus far so nobly advanced . It is rather for us to be here dedicated to the "
-    "great task remaining before us that from these honored dead we take "
-    "increased devotion to that cause for which they gave the last full measure "
-    "of devotion that we here highly resolve that these dead shall not have died "
-    "in vain that this nation under God shall have a new birth of freedom and "
-    "that government of the people by the people for the people shall not perish "
-    "from the earth . "
-)
-
-
-def _tiny_tokenizer():
-    """Build a byte-level BPE tokenizer offline (no download) from _CORPUS."""
-    from tokenizers import ByteLevelBPETokenizer
-    from transformers import GPT2TokenizerFast
-    inner = ByteLevelBPETokenizer()
-    inner.train_from_iterator([_CORPUS * 40], vocab_size=1000, min_frequency=1,
-                              special_tokens=["<|endoftext|>"])
-    tok = GPT2TokenizerFast(tokenizer_object=inner._tokenizer)
-    tok.add_special_tokens({"eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>"})
-    eos = inner.token_to_id("<|endoftext|>")
-    tok.eos_token_id = tok.pad_token_id = tok.bos_token_id = eos
-    return tok
 
 
 @lru_cache(maxsize=None)
