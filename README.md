@@ -37,11 +37,20 @@ or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
 steps).
 
-To run against real weights with no network — e.g. after copying a `distilgpt2`
+To run against real weights with no network — e.g. after copying a model
 snapshot onto the machine — point `--model` at the directory:
 
 ```
 python3 morse_stego.py "secret message" --model /path/to/distilgpt2
+```
+
+`fetch_tinystories.py` collates a small real model (`roneneldan/TinyStories-3M`,
+~12 MB) plus its tokenizer into one self-contained folder, so anyone can
+reproduce the same test on a machine with Hugging Face access:
+
+```
+python3 fetch_tinystories.py            # -> ./tinystories_3m/
+python3 morse_stego.py "secret message" --model ./tinystories_3m
 ```
 
 ## Requirements
