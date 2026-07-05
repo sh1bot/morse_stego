@@ -125,31 +125,28 @@ def cover_to_morse(cover):
     return "".join(wordtomorse(w) for w in cover.split())
 
 
-# A generated token is usable only if it is a clean word part: a run of letters
-# with at most one trailing punctuation mark (a word-start also carries a single
-# leading space), or a bare sentence-ender. Anything with internal whitespace or
-# stray characters is rejected so words split back out exactly as generated.
-_WORD_RE = re.compile(r"[A-Za-z]+[^\sA-Za-z0-9]?")
-
-
 def _classify(text):
     """Classify a decoded token as ('start'|'cont'|'ender', core) or None.
 
-    start : begins a new word (leading space), core is the letters/punct.
-    cont  : continues the current word (no leading space) -- multi-token words.
+    start : begins a new word -- one leading space, then any non-space run.
+    cont  : continues the current word -- any non-space run, no leading space.
     ender : a bare sentence-ender ('.', '?', '!'), whichever side the space is on.
+
+    Only the leading space (word boundary) and the absence of internal whitespace
+    matter. A word's *content* is otherwise unconstrained: since a symbol is read
+    off a word's last letter, every token before the last is free choice, which is
+    what keeps the search wide. Tokens with internal or trailing whitespace are the
+    only ones rejected, so the decoded text splits back into the same words.
     """
-    if not text or "\n" in text or "\t" in text:
+    if not text:
         return None
     leading = text[:1] == " "
     core = text[1:] if leading else text
-    if not core or " " in core:
+    if not core or any(c.isspace() for c in core):
         return None
     if core in ENDERS:
         return ("ender", core)
-    if _WORD_RE.fullmatch(core):
-        return ("start" if leading else "cont", core)
-    return None
+    return ("start" if leading else "cont", core)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +175,7 @@ def get_model():
         print(f"[no HF access ({type(e).__name__}); using tiny random GPT-2 — "
               f"text is gibberish but constraints are real]\n")
         tok = _tiny_tokenizer()
-        cfg = GPT2Config(vocab_size=tok.vocab_size, n_positions=128,
+        cfg = GPT2Config(vocab_size=tok.vocab_size, n_positions=1024,
                          n_embd=64, n_layer=2, n_head=2)
         model = GPT2LMHeadModel(cfg)
     model.eval()
@@ -195,14 +192,40 @@ def get_model():
     return _MODEL
 
 
+# Public-domain corpus (Lincoln's Gettysburg Address, 1863) for the offline
+# tokenizer -- enough varied word endings (vowels, consonants, y, and the '.'
+# sentence-ender) that the constrained search can actually satisfy real messages
+# without a downloaded model. Only used when Hugging Face is unreachable.
+_CORPUS = (
+    "Four score and seven years ago our fathers brought forth on this continent "
+    "a new nation conceived in liberty and dedicated to the proposition that all "
+    "men are created equal . Now we are engaged in a great civil war testing "
+    "whether that nation or any nation so conceived and so dedicated can long "
+    "endure . We are met on a great battlefield of that war . We have come to "
+    "dedicate a portion of that field as a final resting place for those who here "
+    "gave their lives that that nation might live . It is altogether fitting and "
+    "proper that we should do this . But in a larger sense we can not dedicate we "
+    "can not consecrate we can not hallow this ground . The brave men living and "
+    "dead who struggled here have consecrated it far above our poor power to add "
+    "or detract . The world will little note nor long remember what we say here "
+    "but it can never forget what they did here . It is for us the living rather "
+    "to be dedicated here to the unfinished work which they who fought here have "
+    "thus far so nobly advanced . It is rather for us to be here dedicated to the "
+    "great task remaining before us that from these honored dead we take "
+    "increased devotion to that cause for which they gave the last full measure "
+    "of devotion that we here highly resolve that these dead shall not have died "
+    "in vain that this nation under God shall have a new birth of freedom and "
+    "that government of the people by the people for the people shall not perish "
+    "from the earth . "
+)
+
+
 def _tiny_tokenizer():
-    """Build a byte-level BPE tokenizer offline (no download)."""
+    """Build a byte-level BPE tokenizer offline (no download) from _CORPUS."""
     from tokenizers import ByteLevelBPETokenizer
     from transformers import GPT2TokenizerFast
-    corpus = ("the sun is bright and warm . the sky is blue and clear . "
-              "weather today is calm cool and dry . ") * 50
     inner = ByteLevelBPETokenizer()
-    inner.train_from_iterator([corpus], vocab_size=500, min_frequency=1,
+    inner.train_from_iterator([_CORPUS * 40], vocab_size=1000, min_frequency=1,
                               special_tokens=["<|endoftext|>"])
     tok = GPT2TokenizerFast(tokenizer_object=inner._tokenizer)
     tok.add_special_tokens({"eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>"})
@@ -338,7 +361,7 @@ def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
 
     text, cover, logp, ok = backtrack(
         prompt, accept, lambda s: s[2], start_state=(0, "", False),
-        floor=floor, top_k=top_k, budget=budget, max_tokens=m * 4 + 8)
+        floor=floor, top_k=top_k, budget=budget, max_tokens=m * 6 + 8)
     return norm, morse, text, cover, logp, ok
 
 
