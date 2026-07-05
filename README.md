@@ -1,10 +1,12 @@
 # morse_stego
 
 Hide a short string inside plausible language-model text, then prove it back
-out. The cover text is generated so that each *token's* last letter spells one
-Morse symbol of your message — vowel-final = dot, consonant-final = dash,
-`y`/`g`/space-final = gap — followed by a sentence-ender. Reversing the generated
-tokens recovers the Morse, which decodes back to your string.
+out. The cover text is generated so that each whitespace *word's* last letter
+spells one Morse symbol of your message — vowel-final = dot, consonant-final =
+dash, `y`/`g`/punctuation-final = gap — followed by a sentence-ender. Reversing
+the words recovers the Morse, which decodes back to your string. Because a symbol
+rides on a whole word — which may be a couple of LM tokens — the reversal reads
+the plain string and never has to reproduce the model's tokenization.
 
 ```
 text  --encode-->  morse  --constrained generate-->  LM cover text
@@ -12,11 +14,12 @@ text  --encode-->  morse  --constrained generate-->  LM cover text
 ```
 
 The generator is a backtracking constrained decoder: a best-first walk over the
-LM's tokens under the per-symbol constraint, backpedaling to re-pick earlier
-tokens whenever a position dead-ends, so the whole message (trailing ender
-included) is satisfied rather than greedily stranded. One symbol per token keeps
-the search dense — a real model encodes a phrase like `"secret message"` in a few
-dozen tokens.
+LM's tokens that builds one word at a time, backpedaling to re-pick earlier
+tokens whenever a position dead-ends. Each word is held whole as it is built (so
+the symbol rule can weigh more than the last letter later) and capped at a few
+tokens — without that cap the search tunnels into absurdly long words chasing a
+required final letter instead of trying a different word. With the cap a real
+model encodes a phrase like `"secret message"` in well under a second.
 
 The codec, model loader, decoder, and CLI live in `morse_stego.py`; the offline
 fallback model lives in `offline_model.py`.
@@ -35,7 +38,9 @@ input has nothing encodable, `2` on a round-trip mismatch.
 Flags: `--prompt` (seed text), `--model` (HF hub id or a local model directory;
 or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
-steps).
+steps), `--cap` (max LM tokens per word), `--seed` (vary the cover text
+reproducibly — same seed, same output; different seed, different cover). Re-run
+with a few seeds to pick a cover you like.
 
 To run against real weights with no network — e.g. after copying a model
 snapshot onto the machine — point `--model` at the directory:
@@ -63,7 +68,7 @@ been fetched later runs load it silently — set `HF_HOME` to a persistent
 directory to keep that cache across throwaway environments.
 
 Offline (no network and nothing cached), it falls back to a small GPT-2 trained
-on the fly (see `offline_model.py`) on a "token-ending pangram" corpus — short
+on the fly (see `offline_model.py`) on a "word-ending pangram" corpus — short
 words grouped so every final-letter class (vowel, consonant, `y`) is covered.
 The text is gibberish but the constraint and the round trip are exactly the same.
 Training takes a few seconds and is cached under `~/.cache/morse_stego`, so only

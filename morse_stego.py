@@ -6,16 +6,20 @@ Pipeline (all four stages on one command):
     text  --encode-->  morse  --constrained generate-->  LM cover text
           <--decode--  morse  <--reverse-------------
 
-The cover text is generated so that each token's "last letter" spells one morse
-symbol of your string (vowel-final = dot, consonant-final = dash, y-final/space
-= gap), with a trailing sentence-ender. We then reverse the tokens back to morse
-and decode, and assert the result equals your (normalized) input.
+The cover text is generated so that each whitespace *word's* last letter spells
+one morse symbol of your string (vowel-final = dot, consonant-final = dash,
+y/g/punctuation-final = gap), with a trailing sentence-ender. We then reverse the
+words back to morse and decode, and assert the result equals your (normalized)
+input. Because a symbol rides on a whole word -- which may be a couple of LM
+tokens -- the reversal reads the plain string and never has to reproduce the
+model's tokenization.
 
-The generator is a backtracking constrained decoder over a real LM (distilgpt2,
-or a tiny random GPT-2 offline): a best-first walk over the model's tokens under
-the per-symbol constraint that backpedals and re-picks earlier tokens whenever a
-position dead-ends, so the whole message (ender included) is satisfied rather
-than greedily stranded.
+The generator is a backtracking constrained decoder over a real LM: a best-first
+walk over the model's tokens that builds one word at a time, backpedaling to
+re-pick earlier tokens whenever a position dead-ends. A word is held whole as it
+is built (so wordtomorse can weigh more than the last letter in future) and is
+capped at a few tokens -- without that cap the search tunnels into absurdly long
+words chasing a required final letter instead of trying a different word.
 
 Usage:
     python3 morse_stego.py "SOS"
@@ -30,7 +34,9 @@ them; the morse codec and --help stay import-light.
 """
 
 import argparse
+import math
 import os
+import random
 import re
 import sys
 from functools import lru_cache
@@ -57,7 +63,7 @@ MORSE_INV = {code: letter for letter, code in MORSE.items()}
 
 
 def wordtomorse(word):
-    """Map a token to its morse symbol: '.', '-', or ' '.
+    """Map a whole word to its morse symbol: '.', '-', or ' '.
 
     Dot   = ends in a vowel.
     Dash  = ends in a consonant EXCEPT 'y' and 'g'.
@@ -65,7 +71,10 @@ def wordtomorse(word):
 
     'y' and 'g' both fall through to the gap so that spaces -- which are under
     pressure from the three-space word separator -- have more ways to be spelled.
-    """
+
+    The whole word is passed in (not just its last letter) and this is the single
+    place both encode and decode decide a symbol, so a future rule can weigh more
+    of the word without the two sides drifting apart."""
     word = word.strip()
     if not word:
         return " "
@@ -112,20 +121,45 @@ def morse_to_text(morse):
     return " ".join(words)
 
 
-def tokens_to_morse(pieces, strip_ender=True):
-    """Reverse generator output back to the morse string.
+def message_words(cover):
+    """Split cover text into the words that carry the message: whitespace-
+    separated, with the trailing sentence-ender (the postcondition slot, not part
+    of the message) stripped first."""
+    cover = cover.rstrip()
+    while cover and cover[-1] in ENDERS:
+        cover = cover[:-1].rstrip()
+    return cover.split()
 
-    pieces      : the list of decoded generated tokens (no prompt), as returned
-                  by backtrack(). Working on the per-token pieces (not the
-                  decoded text) is what makes the reversal exact -- decoding then
-                  re-tokenizing would not preserve token boundaries.
-    strip_ender : drop a trailing sentence-ender token (the postcondition slot);
-                  it is not part of the morse message.
-    """
-    toks = list(pieces)
-    if strip_ender and toks and toks[-1].strip() in ENDERS:
-        toks = toks[:-1]
-    return "".join(wordtomorse(t) for t in toks)
+
+def cover_to_morse(cover):
+    """Reverse cover text back to its morse string by reading whole words.
+
+    Each whitespace word maps to one morse symbol via wordtomorse. A word may be
+    any number of LM tokens -- reading words instead of tokens is what lets encode
+    and decode meet over the plain string, with no token boundaries to preserve."""
+    return "".join(wordtomorse(w) for w in message_words(cover))
+
+
+def _classify(text):
+    """Classify a decoded token as ('start'|'cont'|'ender', core) or None.
+
+    start : begins a new word -- one leading space, then any non-space run.
+    cont  : continues the current word -- any non-space run, no leading space.
+    ender : a bare sentence-ender ('.', '?', '!'), whichever side the space is on.
+
+    A word's content is unconstrained apart from the leading space that marks a
+    boundary: since a symbol is read off the last letter, every token before the
+    last is free. Only tokens with internal/trailing whitespace are rejected, so
+    the decoded text splits back into exactly the words we built."""
+    if not text or "�" in text:            # reject partial-UTF-8 byte tokens
+        return None
+    leading = text[:1] == " "
+    core = text[1:] if leading else text
+    if not core or any(c.isspace() for c in core):
+        return None
+    if core in ENDERS:
+        return ("ender", core)
+    return ("start" if leading else "cont", core)
 
 
 # --------------------------------------------------------------------------- #
@@ -192,49 +226,72 @@ def _next_logprobs(ids):
 # Backtracking constrained decoder.
 # --------------------------------------------------------------------------- #
 
-def backtrack(prompt, length, allowed, floor=-12.0, top_k=50, budget=20_000):
+def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
+              budget=20_000, max_tokens=256, seed=None):
     """Best-first DFS with backtracking on the real LM under a plausibility floor.
 
-    allowed(token_text, step) -> bool
+    accept(state, token_text) -> next_state or None
+        Successor state if `token_text` may legally follow, else None (reject).
+        The caller threads whatever it needs through `state` -- here: which word
+        we are on and the whole word in progress.
+    done(state) -> bool
+        True when `state` is a complete, valid message; the search stops there.
     floor : reject any candidate whose next-token logprob is below this; a
             position with no surviving candidate is a dead-end to back out of.
     top_k : how many of the vocab's best tokens to consider per position (the
             real vocab is ~50k; we never need the long tail).
+    seed  : if given, perturb the candidate ordering with seeded Gumbel noise --
+            i.e. sample the walk from the model instead of taking the strict
+            best-first order, giving a different (reproducible) cover per seed.
 
-    Returns (text, pieces, total_logp, ok), where `pieces` is the list of
-    decoded generated tokens. Finds the first full-length legal sequence in
-    best-first order -- keeps the high-plausibility choices it can and only
-    rewrites the ones that led into a corner.
+    Returns (text, cover, total_logp, ok), where `text` is the full decoding
+    (prompt included) and `cover` is just the generated continuation -- the part
+    that carries the message. Finds the first legal sequence in the chosen order.
     """
     tok, _ = get_model()
+    banned = set(tok.all_special_ids or [])  # never weave EOS/pad/etc into a word
+    rng = random.Random(seed) if seed is not None else None
     start = tok(prompt, return_tensors=None)["input_ids"]
     ids = list(start)
     cum = [0.0]
-    _ret = lambda ok: (tok.decode(ids), [_text(i) for i in ids[len(start):]], cum[-1], ok)
+    states = [start_state]
 
-    def candidates_at():
-        step = len(ids) - len(start)         # tokens generated so far
+    def _ret(ok):
+        return tok.decode(ids), tok.decode(ids[len(start):]), cum[-1], ok
+
+    def candidates_at(state):
+        if len(ids) - len(start) >= max_tokens:
+            return []                        # too long -> treat as a dead-end
         lp = _next_logprobs(ids)
         topv, topi = lp.topk(min(top_k, lp.shape[-1]))
-        cs = [(i, v) for v, i in zip(topv.tolist(), topi.tolist())
-              if v >= floor and allowed(_text(i), step)]
-        return cs                            # topk is already best-first
+        cs = []
+        for v, i in zip(topv.tolist(), topi.tolist()):
+            if v < floor or i in banned:
+                continue                     # topk is best-first; rest only lower
+            ns = accept(state, _text(i))
+            if ns is not None:
+                cs.append((i, v, ns))
+        if rng is not None:                  # Gumbel-top-k: order = a sample
+            u = lambda: min(max(rng.random(), 1e-9), 1 - 1e-9)
+            cs.sort(key=lambda c: c[1] - math.log(-math.log(u())), reverse=True)
+        return cs
 
-    stack = [candidates_at()]                # untried candidates for each position
+    stack = [candidates_at(states[-1])]      # untried candidates for each position
     steps = 0
-    while len(ids) - len(start) < length:
+    while True:
         if (steps := steps + 1) > budget:
             return _ret(False)
         frame = stack[-1]
         if not frame:                        # dead-end -> backpedal one level
             if len(ids) == len(start):
                 return _ret(False)           # backed past prompt: infeasible
-            ids.pop(); cum.pop(); stack.pop()
+            ids.pop(); cum.pop(); states.pop(); stack.pop()
             continue
-        t, lp = frame.pop(0)                 # take & consume best remaining sibling
-        ids.append(t); cum.append(cum[-1] + lp)
-        stack.append(candidates_at())
-    return _ret(True)
+        t, lp, ns = frame.pop(0)             # take & consume best remaining sibling
+        ids.append(t); cum.append(cum[-1] + lp); states.append(ns)
+        if done(ns):
+            return _ret(True)
+        stack.append(candidates_at(ns))
 
 
 # --------------------------------------------------------------------------- #
@@ -242,36 +299,65 @@ def backtrack(prompt, length, allowed, floor=-12.0, top_k=50, budget=20_000):
 # --------------------------------------------------------------------------- #
 
 def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
-         budget=50_000):
-    """Encode `secret` to morse and generate cover text whose tokens spell it.
+         budget=50_000, cap=2, seed=None):
+    """Encode `secret` to morse and generate cover text whose words spell it.
 
-    Returns (normalized_secret, morse, cover_text, pieces, logprob, ok)."""
+    The constraint runs per *word*: word i must have wordtomorse(word) == morse[i].
+    The search state carries the index of the word being built, the whole word so
+    far, and how many tokens it has taken; a word commits when the next word opens
+    (or the ender closes the last). `cap` bounds tokens per word -- two is enough
+    for "modest"+"ly" shapes and keeps the search from tunnelling into long words.
+
+    Returns (normalized_secret, morse, text, cover, logprob, ok), where `text` is
+    the full sentence and `cover` is the generated continuation to reverse."""
     norm = normalize(secret)
     morse = text_to_morse(norm)              # 3-space word sep -> only . - and spaces
+    m = len(morse)
+    if m == 0:
+        return norm, morse, prompt, "", 0.0, False
 
-    def constraint(t, step):
-        if step >= len(morse):               # postcondition: end the sentence
-            return t.strip() in ENDERS
-        return wordtomorse(t) == morse[step]
+    # state = (word_index, word_in_progress, tokens_in_word, finished)
+    def accept(state, token_text):
+        wi, cur, ntok, fin = state
+        if fin:
+            return None
+        cls = _classify(token_text)
+        if cls is None:
+            return None
+        kind, core = cls
+        if kind == "ender":                  # closes the last word, ends sentence
+            if cur and wi == m - 1 and wordtomorse(cur) == morse[wi]:
+                return (wi, cur, ntok, True)
+            return None
+        if kind == "cont":                   # extend the current word (up to cap)
+            if not cur or ntok >= cap:
+                return None
+            return (wi, cur + core, ntok + 1, False)
+        # kind == "start": open a word (committing the previous one first)
+        if not cur:                          # the very first word of the cover
+            return (wi, core, 1, False)
+        if wordtomorse(cur) != morse[wi] or wi + 1 > m - 1:
+            return None                       # wrong symbol, or no word slot left
+        return (wi + 1, core, 1, False)
 
-    text, pieces, logp, ok = backtrack(
-        prompt, len(morse) + 1, constraint, floor=floor, top_k=top_k, budget=budget)
-    return norm, morse, text, pieces, logp, ok
+    text, cover, logp, ok = backtrack(
+        prompt, accept, lambda s: s[3], start_state=(0, "", 0, False),
+        floor=floor, top_k=top_k, budget=budget, max_tokens=m * cap + 8, seed=seed)
+    return norm, morse, text, cover, logp, ok
 
 
-def highlight_symbol_char(piece):
-    """Render a generated token with the character that decides its morse symbol
-    -- the last non-whitespace char, which is what wordtomorse keys on -- shown
-    in bold yellow. A whitespace/empty token has no such char and spells a gap.
+def highlight_symbol_char(word):
+    """Render a word with the character that decides its morse symbol -- the last
+    non-whitespace char, which is what wordtomorse keys on -- shown in bold yellow.
 
-    Handy for seeing why a token counts as dot/dash/gap: punctuation, 'y' and 'g'
-    all land in the gap class, so a token ending in ',' or '.' fills a space."""
+    Handy for seeing why a word counts as dot/dash/gap: punctuation, 'y' and 'g'
+    all land in the gap class, so a word ending in ',' or 'y' fills a space."""
     hl, rst = "\033[1;33m", "\033[0m"
-    core = piece.rstrip()
+    core = word.rstrip()
     if not core.strip():                         # whitespace/empty -> gap, no char
-        return f"[{piece}]"
+        return f"[{word}]"
     i = len(core) - 1                            # index of last non-whitespace char
-    return f"[{piece[:i]}{hl}{piece[i]}{rst}{piece[i + 1:]}]"
+    return f"[{word[:i]}{hl}{word[i]}{rst}{word[i + 1:]}]"
 
 
 def main(argv=None):
@@ -283,11 +369,14 @@ def main(argv=None):
     p.add_argument("--floor", type=float, default=-18.0, help="min per-token logprob (lower = more permissive)")
     p.add_argument("--top-k", type=int, default=200, help="candidate tokens considered per position")
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
+    p.add_argument("--cap", type=int, default=2, help="max LM tokens per word (bounds the search)")
+    p.add_argument("--seed", type=int, default=None, help="seed to vary the cover text (reproducible)")
     args = p.parse_args(argv)
     MODEL_NAME = args.model
 
-    norm, morse, cover, pieces, logp, ok = hide(
-        args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k, budget=args.budget)
+    norm, morse, text, cover, logp, ok = hide(
+        args.text, prompt=args.prompt, floor=args.floor, top_k=args.top_k,
+        budget=args.budget, cap=args.cap, seed=args.seed)
 
     print(f"input       : {args.text!r}")
     print(f"normalized  : {norm!r}")
@@ -300,12 +389,13 @@ def main(argv=None):
         print("Try a shorter string, a lower --floor, or a higher --top-k.")
         return 1
 
-    print(f"\ncover text  : {cover!r}")
-    print(f"logprob     : {logp:.2f}   ({len(pieces)} tokens)")
+    print(f"\ncover text  : {text!r}")
+    words = message_words(cover)
+    print(f"logprob     : {logp:.2f}   ({len(words)} words)")
 
-    recovered_morse = tokens_to_morse(pieces)   # OUTPUT -> morse (drops the ender)
+    recovered_morse = cover_to_morse(cover)     # OUTPUT words -> morse (drops ender)
     decoded = morse_to_text(recovered_morse)    # morse -> text
-    print("\ntokens         : " + " ".join(highlight_symbol_char(p) for p in pieces))
+    print("\nwords          : " + " ".join(highlight_symbol_char(w) for w in words))
     print(f"reversed morse : {recovered_morse!r}")
     print(f"decoded text   : {decoded!r}")
 
