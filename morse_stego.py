@@ -60,8 +60,11 @@ def wordtomorse(word):
     """Map a token to its morse symbol: '.', '-', or ' '.
 
     Dot   = ends in a vowel.
-    Dash  = ends in a consonant EXCEPT 'y'.
-    Space = ends in 'y', or is empty / whitespace / punctuation.
+    Dash  = ends in a consonant EXCEPT 'y' and 'g'.
+    Space = ends in 'y' or 'g', or is empty / whitespace / punctuation.
+
+    'y' and 'g' both fall through to the gap so that spaces -- which are under
+    pressure from the three-space word separator -- have more ways to be spelled.
     """
     word = word.strip()
     if not word:
@@ -69,7 +72,7 @@ def wordtomorse(word):
     last = word[-1].lower()
     if last in "aeiou":
         return "."
-    if last in "bcdfghjklmnpqrstvwxz":        # note: no 'y'
+    if last in "bcdfhjklmnpqrstvwxz":         # note: no 'y' or 'g' (both gaps)
         return "-"
     return " "
 

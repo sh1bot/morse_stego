@@ -3,7 +3,7 @@
 Hide a short string inside plausible language-model text, then prove it back
 out. The cover text is generated so that each *token's* last letter spells one
 Morse symbol of your message — vowel-final = dot, consonant-final = dash,
-`y`-final/space = gap — followed by a sentence-ender. Reversing the generated
+`y`/`g`/space-final = gap — followed by a sentence-ender. Reversing the generated
 tokens recovers the Morse, which decodes back to your string.
 
 ```
