@@ -17,9 +17,10 @@ model's tokenization.
 The generator is a backtracking constrained decoder over a real LM: a best-first
 walk over the model's tokens that builds one word at a time, backpedaling to
 re-pick earlier tokens whenever a position dead-ends. A word is held whole as it
-is built (so wordtomorse can weigh more than the last letter in future) and is
-capped at a few tokens -- without that cap the search tunnels into absurdly long
-words chasing a required final letter instead of trying a different word.
+is built (so wordtomorse can weigh more than the last letter in future). By
+default a word is a single token -- one clean whole word per symbol -- but --cap
+lets a word span tokens to hit a required final letter when a message is
+otherwise infeasible, at the cost of glued non-words ("for"+"no" -> "forno").
 
 Usage:
     python3 morse_stego.py "SOS"
@@ -299,14 +300,17 @@ def backtrack(prompt, accept, done, start_state, floor=-12.0, top_k=50,
 # --------------------------------------------------------------------------- #
 
 def hide(secret, prompt="The weather today is", floor=-18.0, top_k=200,
-         budget=50_000, cap=2, seed=None):
+         budget=50_000, cap=1, seed=None):
     """Encode `secret` to morse and generate cover text whose words spell it.
 
     The constraint runs per *word*: word i must have wordtomorse(word) == morse[i].
     The search state carries the index of the word being built, the whole word so
     far, and how many tokens it has taken; a word commits when the next word opens
-    (or the ender closes the last). `cap` bounds tokens per word -- two is enough
-    for "modest"+"ly" shapes and keeps the search from tunnelling into long words.
+    (or the ender closes the last). `cap` bounds tokens per word. cap=1 (the
+    default) gives one clean whole-token word per symbol; raising it lets a word
+    span tokens to hit a required final letter -- more feasible on a weak model,
+    but it glues tokens ("for"+"no" -> "forno"), so prefer the lowest cap that
+    still encodes your message.
 
     Returns (normalized_secret, morse, text, cover, logprob, ok), where `text` is
     the full sentence and `cover` is the generated continuation to reverse."""
@@ -369,7 +373,7 @@ def main(argv=None):
     p.add_argument("--floor", type=float, default=-18.0, help="min per-token logprob (lower = more permissive)")
     p.add_argument("--top-k", type=int, default=200, help="candidate tokens considered per position")
     p.add_argument("--budget", type=int, default=50_000, help="max backtracking steps before giving up")
-    p.add_argument("--cap", type=int, default=2, help="max LM tokens per word (bounds the search)")
+    p.add_argument("--cap", type=int, default=1, help="max LM tokens per word (1 = clean whole words; raise if infeasible)")
     p.add_argument("--seed", type=int, default=None, help="seed to vary the cover text (reproducible)")
     p.add_argument("--count", type=int, default=1, help="produce N covers (different seeds) to choose from")
     args = p.parse_args(argv)
@@ -408,7 +412,7 @@ def report(text, cover, logp, morse, norm, ok):
     or 2 (round-trip mismatch)."""
     if not ok:
         print("\nINFEASIBLE: could not spell that message with this model/prompt.")
-        print("Try a shorter string, a lower --floor, or a higher --top-k.")
+        print("Try a lower --floor, a higher --top-k, or a higher --cap.")
         return 1
 
     print(f"\ncover text  : {text!r}")

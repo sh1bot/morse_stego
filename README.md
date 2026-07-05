@@ -16,10 +16,12 @@ text  --encode-->  morse  --constrained generate-->  LM cover text
 The generator is a backtracking constrained decoder: a best-first walk over the
 LM's tokens that builds one word at a time, backpedaling to re-pick earlier
 tokens whenever a position dead-ends. Each word is held whole as it is built (so
-the symbol rule can weigh more than the last letter later) and capped at a few
-tokens — without that cap the search tunnels into absurdly long words chasing a
-required final letter instead of trying a different word. With the cap a real
-model encodes a phrase like `"secret message"` in well under a second.
+the symbol rule can weigh more than the last letter later). By default a word is
+a single token — one clean whole word per symbol — which on a real model encodes
+a phrase like `"secret message"` in well under a second. `--cap N` lets a word
+span up to N tokens to hit a required final letter when a message is otherwise
+infeasible, but that glues tokens into non-words (`for`+`no` → `forno`), so use
+the lowest cap that still works.
 
 The codec, model loader, decoder, and CLI live in `morse_stego.py`; the offline
 fallback model lives in `offline_model.py`.
@@ -38,7 +40,8 @@ input has nothing encodable, `2` on a round-trip mismatch.
 Flags: `--prompt` (seed text), `--model` (HF hub id or a local model directory;
 or set `MORSE_MODEL`), `--floor` (min per-token logprob; lower = more
 permissive), `--top-k` (candidates per position), `--budget` (max backtracking
-steps), `--cap` (max LM tokens per word), `--seed` (vary the cover text
+steps), `--cap` (max LM tokens per word; 1 = clean whole words, raise if
+infeasible), `--seed` (vary the cover text
 reproducibly — same seed, same output; different seed, different cover),
 `--count` (print N covers from consecutive seeds, all from one model load, to
 pick one you like).
