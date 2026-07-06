@@ -41,107 +41,17 @@ import heapq
 import math
 import os
 import random
-import re
 import sys
 from functools import lru_cache
 
+from morse_codec import (ENDERS, cover_to_morse, message_words, morse_to_text,
+                         normalize, text_to_morse, wordtomorse)
+
 # --------------------------------------------------------------------------- #
-# Morse codec -- one symbol mapping shared by encode and decode, so the text
-# that drives generation and the parser that reads it back can't drift apart.
+# The pure, torch-free morse codec lives in morse_codec (imported above) so the
+# generator here and the standalone decoder there share one symbol mapping. The
+# token classifier below is generation-only and stays here.
 # --------------------------------------------------------------------------- #
-
-ENDERS = {".", "?", "!"}
-
-# International Morse: letters + digits.
-MORSE = {
-    "A": ".-",    "B": "-...",  "C": "-.-.",  "D": "-..",   "E": ".",
-    "F": "..-.",  "G": "--.",   "H": "....",  "I": "..",    "J": ".---",
-    "K": "-.-",   "L": ".-..",  "M": "--",    "N": "-.",    "O": "---",
-    "P": ".--.",  "Q": "--.-",  "R": ".-.",   "S": "...",   "T": "-",
-    "U": "..-",   "V": "...-",  "W": ".--",   "X": "-..-",  "Y": "-.--",
-    "Z": "--..",
-    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
-    "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.",
-}
-MORSE_INV = {code: letter for letter, code in MORSE.items()}
-
-
-def wordtomorse(word):
-    """Map a whole word to its morse symbol: '.', '-', or ' '.
-
-    Dot   = ends in a vowel.
-    Dash  = ends in a consonant EXCEPT 'y' and 'g'.
-    Space = ends in 'y' or 'g', or is empty / whitespace / punctuation.
-
-    'y' and 'g' both fall through to the gap so that spaces -- which are under
-    pressure from the three-space word separator -- have more ways to be spelled.
-
-    The whole word is passed in (not just its last letter) and this is the single
-    place both encode and decode decide a symbol, so a future rule can weigh more
-    of the word without the two sides drifting apart."""
-    word = word.strip()
-    if not word:
-        return " "
-    last = word[-1].lower()
-    if last in "aeiou":
-        return "."
-    if last in "bcdfhjklmnpqrstvwxz":         # note: no 'y' or 'g' (both gaps)
-        return "-"
-    return " "
-
-
-def normalize(text):
-    """Uppercase and keep only morse-encodable characters, collapsing whitespace
-    to single word breaks. This is exactly what a decoded round trip can
-    reproduce (morse is case-insensitive and has only the table's characters)."""
-    words = []
-    for word in text.upper().split():
-        kept = "".join(c for c in word if c in MORSE)
-        if kept:
-            words.append(kept)
-    return " ".join(words)
-
-
-def text_to_morse(text, word_sep="   "):
-    """Encode text to a morse string (letters space-separated, words by word_sep).
-
-    The default word_sep is three spaces so the result is only dots, dashes and
-    spaces -- reproducible one-token-per-symbol by a constraint that has no way
-    to emit a '/'. morse_to_text decodes ' / ' and 3+ spaces alike."""
-    words = []
-    for word in text.upper().split():
-        words.append(" ".join(MORSE.get(ch, "?") for ch in word))
-    return word_sep.join(words)
-
-
-def morse_to_text(morse):
-    """Decode a morse string to text. Words split on ' / ' or 3+ spaces; letters
-    within a word split on single spaces. Unknown codes -> '?'."""
-    words = []
-    for word in re.split(r"\s*/\s*|\s{3,}", morse.strip()):
-        if not word:
-            continue
-        words.append("".join(MORSE_INV.get(code, "?") for code in word.split()))
-    return " ".join(words)
-
-
-def message_words(cover):
-    """Split cover text into the words that carry the message: whitespace-
-    separated, with the trailing sentence-ender (the postcondition slot, not part
-    of the message) stripped first."""
-    cover = cover.rstrip()
-    while cover and cover[-1] in ENDERS:
-        cover = cover[:-1].rstrip()
-    return cover.split()
-
-
-def cover_to_morse(cover):
-    """Reverse cover text back to its morse string by reading whole words.
-
-    Each whitespace word maps to one morse symbol via wordtomorse. A word may be
-    any number of LM tokens -- reading words instead of tokens is what lets encode
-    and decode meet over the plain string, with no token boundaries to preserve."""
-    return "".join(wordtomorse(w) for w in message_words(cover))
 
 
 def _classify(text):

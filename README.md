@@ -23,8 +23,23 @@ decent whole word. `--cap N` is the longest word (in tokens) the list may reach;
 `cap=2` (the default) reads better than `cap=1` because commas and other short
 tails make nicer sentences, and the ranking keeps the junk out on its own.
 
-The codec, model loader, decoder, and CLI live in `morse_stego.py`; the offline
-fallback model lives in `offline_model.py`.
+The pure morse codec (no torch) lives in `morse_codec.py`, which is also a
+standalone decoder; `morse_stego.py` imports it for generation and validation,
+and the offline fallback model lives in `offline_model.py`.
+
+## Decoding
+
+`morse_codec.py` decodes cover text on its own — no model needed:
+
+```
+python3 morse_codec.py "a place where they ... more."
+python3 morse_codec.py "<full cover>" --prompt "The weather today is"
+```
+
+The message rides in the words *after* the generation prompt, so pass `--prompt`
+to strip a known seed prefix first (the demo prints the full sentence including
+that prompt). `morse_stego.py` validates its own output through the same
+functions, so the encode and decode paths can't drift.
 
 ## Run
 
